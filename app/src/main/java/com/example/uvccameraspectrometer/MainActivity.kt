@@ -26,7 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
+//import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -65,16 +65,40 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.ui.geometry.Offset
 
 
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.core.Preview
+import androidx.camera.core.CameraSelector
+import androidx.core.content.ContextCompat
+import androidx.camera.core.ImageAnalysis
+import androidx.compose.ui.Alignment
+import com.patrykandpatrick.vico.core.chart.values.ChartValues
+import androidx.compose.ui.draw.rotate
+import com.patrykandpatrick.vico.core.component.shape.LineComponent
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
+
+private val USE_USB_CAMERA = false
+
 data class SpectrumData(
     val wavelengths: List<Float>,
-    val intensities: List<Float>
+    val intensities: List<Float>,
+    val maxIntensity: Float
 )
 
+//data class OverlayControls(
+//    val roiTopY: Int = 450,
+//    val roiBottomY: Int = 550,
+//    val calX1: Int = 300,
+//    val calX2: Int = 1600,
+//    val calLambda1: Float = 436f,
+//    val calLambda2: Float = 546f,
+//)
+
 data class OverlayControls(
-    val roiTopY: Int = 450,
-    val roiBottomY: Int = 550,
-    val calX1: Int = 300,
-    val calX2: Int = 1600,
+    val roiTopY: Float = 0.4f,
+    val roiBottomY: Float = 0.5f,
+    val calX1: Float = 0.2f,
+    val calX2: Float = 0.8f,
     val calLambda1: Float = 436f,
     val calLambda2: Float = 546f,
 )
@@ -111,6 +135,9 @@ class MainActivity : ComponentActivity() {
     // ── Current USB device (for multi-device filtering) ──────────────
     private var currentUsbDevice: UsbDevice? = null
 
+    // --- Hi ----
+    private var globalMax = 255f
+
     // ─────────────────────────────────────────────────────────────
     // Permission handling via the modern Activity Result API.
     // ─────────────────────────────────────────────────────────────
@@ -120,7 +147,10 @@ class MainActivity : ComponentActivity() {
             val allGranted = grants.values.all { it }
             if (allGranted) {
                 Log.i(TAG, "All permissions granted")
-                initCameraHelper()
+                if (USE_USB_CAMERA) {
+                    initCameraHelper()
+                }
+//                initCameraHelper()
             } else {
                 Log.w(TAG, "Some permissions denied: $grants")
                 _statusText.value = "Permissions denied — camera cannot start."
@@ -164,8 +194,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Request permissions first; camera init happens in the callback.
-        permissionLauncher.launch(requiredPermissions())
+        if (USE_USB_CAMERA) {
+            // Request permissions first; camera init happens in the callback.
+            permissionLauncher.launch(requiredPermissions())
+        } else {
+            // Camera
+            permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA))
+        }
+
+        var controls by mutableStateOf(OverlayControls())
 
         setContent {
             MaterialTheme {
@@ -183,6 +220,16 @@ class MainActivity : ComponentActivity() {
                     statusColor = statusColor.value,
                     imageWidth = imageWidthState.value,
                     imageHeight = imageHeightState.value,
+
+                    controls = controls,
+                    onControlsChange = { controls = it },
+
+                    startPhoneCamera = { previewView ->
+                        startPhoneCamera(previewView) { controls }
+                    }
+//                    startPhoneCamera = { previewView ->
+//                        startPhoneCamera(previewView, controls)
+//                    }
                 )
             }
         }
@@ -191,7 +238,7 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         // Re-init when returning to foreground (handles USB reconnects).
-        if (cameraHelper == null) {
+        if (USE_USB_CAMERA && cameraHelper == null) {
             initCameraHelper()
         }
     }
@@ -422,6 +469,82 @@ class MainActivity : ComponentActivity() {
         previewSurface = null
     }
 
+    private fun processFrame(
+        data: ByteArray,
+        width: Int,
+        height: Int
+    ) {
+        val y0 = 500          // pick these by inspection
+        val y1 = 580          // (inclusive/exclusive OK either way)
+        val roiH = (y1 - y0).coerceAtLeast(1)
+
+        val spectrum = FloatArray(width)
+
+        for (x in 0 until width) {
+            var sum = 0f
+            for (y in y0 until y1) {
+                val idx = (y * width + x) * 3
+                val r = data[idx].toInt() and 0xFF
+                val g = data[idx + 1].toInt() and 0xFF
+                val b = data[idx + 2].toInt() and 0xFF
+                val yVal = 0.299f * r + 0.587f * g + 0.114f * b
+                sum += yVal
+            }
+            spectrum[x] = sum / roiH
+        }
+
+        runOnUiThread {
+            val intensities = spectrum.toList()
+            val slope = (546.0f - 436.0f) / (1365.0f - 1575.0f)
+            val intercept = 436.0f
+            val wavelengths = List(spectrum.size) { i ->
+                val w = intercept + slope * (i - 1570.0f)
+                (w * 100).toInt() / 100f
+            }
+
+            //---------------DEBUG-----------------
+            val wl = wavelengths
+            val it = intensities
+//            var highCntr = 0
+//            for(i in 0 until intensities.size){
+//                if(intensities[i] > 240){
+//                    highCntr++
+//                }
+//            }
+//            var minCntr = 0
+//            for(i in 0 until intensities.size) {
+//                if (intensities[i] > 5) {
+//                    minCntr++
+//                }
+//            }
+//            if(minCntr < 200){
+//                _statusText.value = "Signal level low. Data may be noisy or unreadable."
+//                statusColor.value = 1
+//            }
+//            else if(highCntr > 35){
+//                _statusText.value = "Sensor may be saturated. Spectral data may be clipped."
+//                statusColor.value = 1
+//            }
+            val dbg = buildString {
+                appendLine("N=${wl.size}")
+                appendLine("λ min=${wl.minOrNull()}  max=${wl.maxOrNull()}")
+                appendLine("λ first=${wl.take(5)}")
+                appendLine("λ last =${wl.takeLast(5)}")
+                appendLine("I min=${it.minOrNull()}  max=${it.maxOrNull()}")
+            }
+            val maxIdx = spectrum.indices.maxBy { spectrum[it] }
+            val maxLambda = wavelengths[maxIdx]
+            //debugText.value = "maxIdx=$maxIdx  λ(max)=$maxLambda\n" + debugText.value
+            debugText.value = ""
+            //--------------END DEBUG----------------
+
+            val maxVal = spectrum.maxOrNull() ?: 1f
+            globalMax = maxOf(globalMax * 0.95f, maxVal)
+
+            spectrumState.value = SpectrumData(wavelengths, intensities, globalMax)
+        }
+    }
+
     private fun captureImage() {
         val helper = cameraHelper
         if (helper == null || !_isCameraOpen.value) {
@@ -450,70 +573,8 @@ class MainActivity : ComponentActivity() {
                     val width = imageWidth ?: return@IFrameCallback
                     val height = imageHeight ?: return@IFrameCallback
                     Log.d(TAG, "frameBytes=${data.size}, expectedYUYV=${width*height*2}, expectedRGB=${width*height*3}")
-                    val y0 = 500          // pick these by inspection
-                    val y1 = 580          // (inclusive/exclusive OK either way)
-                    val roiH = (y1 - y0).coerceAtLeast(1)
 
-                    val spectrum = FloatArray(width)
-
-                    for (x in 0 until width) {
-                        var sum = 0f
-                        for (y in y0 until y1) {
-                            val idx = (y * width + x) * 3
-                            val r = data[idx].toInt() and 0xFF
-                            val g = data[idx + 1].toInt() and 0xFF
-                            val b = data[idx + 2].toInt() and 0xFF
-                            val yVal = 0.299f * r + 0.587f * g + 0.114f * b
-                            sum += yVal
-                        }
-                        spectrum[x] = sum / roiH   // keep float
-                    }
-                    runOnUiThread {
-                        val intensities = spectrum.map { it.toFloat() }
-                        val slope = (546.0f - 436.0f) / (1365.0f - 1575.0f)
-                        val intercept = 436.0f
-                        val wavelengths = List(spectrum.size) { i ->
-                            val w = intercept + slope * (i - 1570.0f)
-                            (w * 100).toInt() / 100f
-                        }
-
-                        //---------------DEBUG-----------------
-                        val wl = wavelengths
-                        val it = intensities
-//                        var highCntr = 0
-//                        for(i in 0 until intensities.size){
-//                            if(intensities[i] > 240){
-//                                highCntr++
-//                            }
-//                        }
-//                        var minCntr = 0
-//                        for(i in 0 until intensities.size) {
-//                            if (intensities[i] > 5) {
-//                                minCntr++
-//                            }
-//                        }
-//                        if(minCntr < 200){
-//                            _statusText.value = "Signal level low. Data may be noisy or unreadable."
-//                            statusColor.value = 1
-//                        }
-//                        else if(highCntr > 35){
-//                            _statusText.value = "Sensor may be saturated. Spectral data may be clipped."
-//                            statusColor.value = 1
-//                        }
-                        val dbg = buildString {
-                            appendLine("N=${wl.size}")
-                            appendLine("λ min=${wl.minOrNull()}  max=${wl.maxOrNull()}")
-                            appendLine("λ first=${wl.take(5)}")
-                            appendLine("λ last =${wl.takeLast(5)}")
-                            appendLine("I min=${it.minOrNull()}  max=${it.maxOrNull()}")
-                        }
-                        val maxIdx = spectrum.indices.maxBy { spectrum[it] }
-                        val maxLambda = wavelengths[maxIdx]
-                        //debugText.value = "maxIdx=$maxIdx  λ(max)=$maxLambda\n" + debugText.value
-                        debugText.value = ""
-                        //--------------END DEBUG----------------
-                        spectrumState.value = SpectrumData(wavelengths, intensities)
-                    }
+                    processFrame(data, width, height)
                 },
                 // Argument 2: The pixel format constant, found in the underlying serenegiant library.
                 4
@@ -524,6 +585,210 @@ class MainActivity : ComponentActivity() {
             _statusText.value = "Capture error: ${e.message}"
             statusColor.value = 0
         }
+    }
+
+    fun pixelToWavelength(
+        x: Float,
+        x1: Float,
+        x2: Float,
+        lambda1: Float,
+        lambda2: Float
+    ): Float {
+        return lambda1 + (x - x1) * (lambda2 - lambda1) / (x2 - x1)
+    }
+
+    fun findPeaks(
+        spectrum: FloatArray,
+        minHeight: Float,
+        minDistance: Int
+    ): List<Int> {
+        val peaks = mutableListOf<Int>()
+
+        for (i in 1 until spectrum.size - 1) {
+            val isPeak = spectrum[i] > spectrum[i - 1] &&
+                    spectrum[i] > spectrum[i + 1] &&
+                    spectrum[i] > minHeight
+
+            if (isPeak) {
+                if (peaks.isEmpty() || i - peaks.last() > minDistance) {
+                    peaks.add(i)
+                }
+            }
+        }
+        return peaks
+    }
+
+    private fun processGrayscaleFrame(
+        data: ByteArray,
+        width: Int,
+        height: Int,
+        rowStride: Int,
+        rotationDegrees: Int,
+        displayWidth: Int,
+        displayHeight: Int,
+        controls: OverlayControls
+    ) {
+
+        val spectrum = FloatArray(height)
+
+        val x0 = (controls.calX1 * displayWidth).toInt().coerceIn(0, displayWidth - 1)
+        val x1 = (controls.calX2 * displayWidth).toInt().coerceIn(0, displayWidth)
+
+        val y0 = (controls.roiTopY * displayHeight).toInt().coerceIn(0, displayHeight - 1)
+        val y1 = (controls.roiBottomY * displayHeight).toInt().coerceIn(0, displayHeight)
+
+        if (x1 <= x0) return
+        if (y1 <= y0) return
+
+        val roiH = (y1 - y0).coerceAtLeast(1)
+
+        fun sampleY(displayX: Int, displayY: Int): Int {
+            val bx: Int
+            val by: Int
+
+            when (rotationDegrees) {
+                0 -> {
+                    bx = displayX
+                    by = displayY
+                }
+                90 -> {
+                    // display is raw image rotated clockwise
+                    bx = displayY
+                    by = height - 1 - displayX
+                }
+                180 -> {
+                    bx = width - 1 - displayX
+                    by = height - 1 - displayY
+                }
+                270 -> {
+                    bx = width - 1 - displayY
+                    by = displayX
+                }
+                else -> {
+                    bx = displayX
+                    by = displayY
+                }
+            }
+
+            if (bx !in 0 until width || by !in 0 until height) return 0
+            val idx = by * rowStride + bx
+            return data[idx].toInt() and 0xFF
+        }
+
+        for (dx in 0 until displayWidth) {
+            var sum = 0f
+            for (dy in y0 until y1) {
+                sum += sampleY(dx, dy)
+            }
+            spectrum[dx] = sum / roiH
+        }
+
+        runOnUiThread {
+            val maxVal = spectrum.maxOrNull() ?: 1f
+            globalMax = maxOf(globalMax * 0.95f, maxVal)
+
+            val peaks = findPeaks(
+                spectrum,
+                minHeight = 0.3f * maxVal,
+                minDistance = 20
+            )
+
+            val intensities = spectrum.toList()
+
+            val wavelengths = List(displayWidth) { x ->
+                pixelToWavelength(
+                    x.toFloat(),
+                    controls.calX1 * displayWidth,
+                    controls.calX2 * displayWidth,
+                    controls.calLambda1,
+                    controls.calLambda2
+                )
+            }
+
+            val pairs = wavelengths.zip(intensities).sortedBy { it.first }
+            val finalWavelengths = pairs.map { it.first }.filter { it > 0f }
+            val finalIntensities = pairs.filter { it.first > 0f }.map { it.second }
+
+            spectrumState.value = SpectrumData(
+                finalWavelengths,
+                finalIntensities,
+                globalMax
+            )
+        }
+    }
+
+    private fun startPhoneCamera(previewView: androidx.camera.view.PreviewView, controlsProvider: () -> OverlayControls) {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+
+        cameraProviderFuture.addListener({
+            val cameraProvider = cameraProviderFuture.get()
+
+            val preview = Preview.Builder().build().also {
+                it.setSurfaceProvider(previewView.surfaceProvider)
+            }
+
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+
+            imageAnalysis.setAnalyzer(ContextCompat.getMainExecutor(this)) { image ->
+
+                val plane = image.planes[0]
+                val buffer = plane.buffer
+                val rowStride = plane.rowStride
+
+                val data = ByteArray(buffer.remaining())
+                buffer.get(data)
+
+                val width = image.width
+                val height = image.height
+                val rotation = image.imageInfo.rotationDegrees
+
+                val displayWidth: Int
+                val displayHeight: Int
+                if (rotation == 90 || rotation == 270) {
+                    displayWidth = height
+                    displayHeight = width
+                } else {
+                    displayWidth = width
+                    displayHeight = height
+                }
+
+//                imageWidthState.value = displayWidth
+//                imageHeightState.value = displayHeight
+
+//                Log.d("CAM", "width=${width}, height=${height}, rowStride=${rowStride}, rotation=${rotation}")
+
+                val controls = controlsProvider()
+                processGrayscaleFrame(
+                    data,
+                    width,
+                    height,
+                    rowStride,
+                    rotation,
+                    displayWidth,
+                    displayHeight,
+                    controls
+                )
+
+                image.close()
+            }
+
+            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+            cameraProvider.unbindAll()
+            cameraProvider.bindToLifecycle(
+                this,
+                cameraSelector,
+                preview,
+                imageAnalysis
+            )
+
+            _isCameraOpen.value = true
+            _statusText.value = "Using Camera"
+            statusColor.value = 2
+
+        }, ContextCompat.getMainExecutor(this))
     }
 }
 
@@ -540,21 +805,81 @@ fun OverlayLines(
     controls: OverlayControls,
 ) {
     Canvas(modifier = modifier) {
-        fun xToPx(xImg: Int) = (xImg.toFloat() / (imageWidth - 1).coerceAtLeast(1)) * size.width
-        fun yToPx(yImg: Int) = (yImg.toFloat() / (imageHeight - 1).coerceAtLeast(1)) * size.height
+        val w = size.width
+        val h = size.height
 
-        val yTop = yToPx(controls.roiTopY)
-        val yBot = yToPx(controls.roiBottomY)
-        val x1 = xToPx(controls.calX1)
-        val x2 = xToPx(controls.calX2)
+        fun xToPx(xImg: Int) = (xImg.toFloat() / (imageWidth - 1).coerceAtLeast(1)) * w
+        fun yToPx(yImg: Int) = (yImg.toFloat() / (imageHeight - 1).coerceAtLeast(1)) * h
+
+        fun pxToX(xImg: Float) = (xImg / w) * imageWidth
+        fun pxToY(yImg: Float) = (yImg / h) * imageHeight
+
+        val yTop = yToPx((controls.roiTopY * imageHeight).toInt())
+        val yBot = yToPx((controls.roiBottomY * imageHeight).toInt())
+        val x1 = xToPx((controls.calX1 * imageWidth).toInt())
+        val x2 = xToPx((controls.calX2 * imageWidth).toInt())
 
         // ROI (horizontal)
-        drawLine(Color.Cyan, Offset(0f, yTop), Offset(size.width, yTop), strokeWidth = 3f)
-        drawLine(Color.Cyan, Offset(0f, yBot), Offset(size.width, yBot), strokeWidth = 3f)
+        drawLine(Color.Cyan, Offset(0f, yTop), Offset(w, yTop), strokeWidth = 3f)
+        drawLine(Color.Cyan, Offset(0f, yBot), Offset(w, yBot), strokeWidth = 3f)
 
         // Calibration (vertical)
-        drawLine(Color.Yellow, Offset(x1, 0f), Offset(x1, size.height), strokeWidth = 3f)
-        drawLine(Color.Yellow, Offset(x2, 0f), Offset(x2, size.height), strokeWidth = 3f)
+        drawLine(Color.Yellow, Offset(x1, 0f), Offset(x1, h), strokeWidth = 3f)
+        drawLine(Color.Yellow, Offset(x2, 0f), Offset(x2, h), strokeWidth = 3f)
+
+        drawLine(Color.Red, Offset(0f, h), Offset(w, h), strokeWidth = 4f)
+        val xTicks = 6
+        for (i in 1..< xTicks) {
+            val x = w * i / xTicks
+            // Vertical grid lines
+            drawLine(
+                androidx.compose.ui.graphics.Color.Red,
+                Offset(x, 0f),
+                Offset(x, h),
+                strokeWidth = 1f,
+                alpha=0.5f
+            )
+            // Tick marks
+            drawLine(Color.Red, Offset(x, h), Offset(x, h-10f), strokeWidth = 3f)
+            // Labels
+            drawContext.canvas.nativeCanvas.drawText(
+                "%.0f".format(pxToX(x)),
+                x,
+                h - 12f,
+                android.graphics.Paint().apply {
+                    textSize = 20f
+                    textAlign = android.graphics.Paint.Align.CENTER
+                    color = androidx.compose.ui.graphics.Color.Yellow.toArgb() //android.graphics.Color.Yellow
+                }
+            )
+        }
+
+        drawLine(Color.Red, Offset(0f, 0f), Offset(0f, h), strokeWidth = 4f)
+        val yTicks = 5
+        for (i in 1..< yTicks) {
+            val y = h * i / yTicks
+            // Horizontal grid lines
+            drawLine(
+                androidx.compose.ui.graphics.Color.Red,
+                Offset(0f, y),
+                Offset(w, y),
+                strokeWidth = 1f,
+                alpha=0.5f
+            )
+            // Tick marks
+            drawLine(Color.Red, Offset(10f, y), Offset(0f, y), strokeWidth = 3f)
+            // Labels
+            drawContext.canvas.nativeCanvas.drawText(
+                "%.0f".format(pxToY(y)),
+                60f,
+                y,
+                android.graphics.Paint().apply {
+                    textSize = 20f
+                    textAlign = android.graphics.Paint.Align.RIGHT
+                    color = androidx.compose.ui.graphics.Color.Cyan.toArgb()
+                }
+            )
+        }
     }
 }
 
@@ -572,7 +897,7 @@ private fun SliderWithIntField(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(label, modifier = Modifier.width(110.dp))
+        Text(label, modifier = Modifier.width(85.dp))
 
         Slider(
             value = value.toFloat(),
@@ -591,7 +916,7 @@ private fun SliderWithIntField(
                 new.toIntOrNull()?.let { onValueChange(it.coerceIn(range)) }
             },
             singleLine = true,
-            modifier = Modifier.width(96.dp),
+            modifier = Modifier.width(70.dp),
             enabled = enabled
         )
     }
@@ -609,12 +934,12 @@ fun ControlsPanel(
     val yRange = 0..(imageHeight - 1).coerceAtLeast(0)
 
     fun updateRoi(topY: Int? = null, bottomY: Int? = null) {
-        val t = (topY ?: controls.roiTopY).coerceIn(yRange)
-        val b = (bottomY ?: controls.roiBottomY).coerceIn(yRange)
+        val t = (topY ?: (controls.roiTopY * imageHeight).toInt()).coerceIn(yRange)
+        val b = (bottomY ?: (controls.roiBottomY * imageHeight).toInt()).coerceIn(yRange)
         onControlsChange(
             controls.copy(
-                roiTopY = minOf(t, b),
-                roiBottomY = maxOf(t, b),
+                roiTopY = minOf(t, b).toFloat() / imageHeight,
+                roiBottomY = maxOf(t, b).toFloat() / imageHeight,
             )
         )
     }
@@ -623,10 +948,10 @@ fun ControlsPanel(
         // clamp only (no reordering except ROI handled above)
         onControlsChange(
             new.copy(
-                roiTopY = new.roiTopY.coerceIn(yRange),
-                roiBottomY = new.roiBottomY.coerceIn(yRange),
-                calX1 = new.calX1.coerceIn(xRange),
-                calX2 = new.calX2.coerceIn(xRange),
+                roiTopY = new.roiTopY.coerceIn(0f, 1f),
+                roiBottomY = new.roiBottomY.coerceIn(0f, 1f),
+                calX1 = new.calX1.coerceIn(0f, 1f),
+                calX2 = new.calX2.coerceIn(0f, 1f),
             )
         )
     }
@@ -634,15 +959,15 @@ fun ControlsPanel(
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
         SliderWithIntField(
             label = "ROI top (y)",
-            value = controls.roiTopY,
+            value = (controls.roiTopY * imageHeight).toInt(),
             range = yRange,
             enabled = enabled,
             onValueChange = { updateRoi(topY = it) }
         )
 
         SliderWithIntField(
-            label = "ROI bottom (y)",
-            value = controls.roiBottomY,
+            label = "ROI bot (y)",
+            value = (controls.roiBottomY * imageHeight).toInt(),
             range = yRange,
             enabled = enabled,
             onValueChange = { updateRoi(bottomY = it) }
@@ -650,18 +975,18 @@ fun ControlsPanel(
 
         SliderWithIntField(
             label = "Cal x1",
-            value = controls.calX1,
+            value = (controls.calX1 * imageWidth).toInt(),
             range = xRange,
             enabled = enabled,
-            onValueChange = { update(controls.copy(calX1 = it)) }
+            onValueChange = { update(controls.copy(calX1 = (it.toFloat() / imageWidth))) }
         )
 
         SliderWithIntField(
             label = "Cal x2",
-            value = controls.calX2,
+            value = (controls.calX2 * imageWidth).toInt(),
             range = xRange,
             enabled = enabled,
-            onValueChange = { update(controls.copy(calX2 = it)) }
+            onValueChange = { update(controls.copy(calX2 = (it.toFloat() / imageWidth))) }
         )
 
         // Calibration wavelengths (text only)
@@ -687,6 +1012,7 @@ fun PreviewWithOverlay(
     onSurfaceAvailable: (Surface) -> Unit,
     onSurfaceDestroyed: () -> Unit,
     isCameraOpen: Boolean,
+    startPhoneCamera: (androidx.camera.view.PreviewView) -> Unit
 ) {
     val w = (imageWidth ?: 1920).coerceAtLeast(1)
     val h = (imageHeight ?: 1080).coerceAtLeast(1)
@@ -696,28 +1022,47 @@ fun PreviewWithOverlay(
         modifier = Modifier
             .fillMaxWidth()
             .aspectRatio(aspect)
+            .padding(16.dp)
             .clip(RoundedCornerShape(12.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
     ) {
-        UvcPreviewSurface(
-            modifier = Modifier.fillMaxSize(),
-            onSurfaceAvailable = onSurfaceAvailable,
-            onSurfaceDestroyed = onSurfaceDestroyed,
-        )
-
-        if (!isCameraOpen) {
-            Text(
-                "No preview",
-                modifier = Modifier.align(Alignment.Center),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.titleMedium,
-            )
-        }
-
-        if (isCameraOpen) {
-            // Draw overlay lines in correct positions for current aspect ratio.
-            OverlayLines(
+        if (USE_USB_CAMERA) {
+            UvcPreviewSurface(
                 modifier = Modifier.fillMaxSize(),
+                onSurfaceAvailable = onSurfaceAvailable,
+                onSurfaceDestroyed = onSurfaceDestroyed,
+            )
+
+            if (!isCameraOpen) {
+                Text(
+                    "No preview",
+                    modifier = Modifier.align(Alignment.Center),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            }
+
+            if (isCameraOpen) {
+                // Draw overlay lines in correct positions for current aspect ratio.
+                OverlayLines(
+                    modifier = Modifier.fillMaxSize(),
+                    imageWidth = w,
+                    imageHeight = h,
+                    controls = controls,
+                )
+            }
+        } else {
+            AndroidView(
+                modifier = Modifier.matchParentSize(),//.fillMaxSize(),
+                factory = { context ->
+                    androidx.camera.view.PreviewView(context).apply {
+                        startPhoneCamera(this)
+                    }
+                }
+            )
+
+            OverlayLines(
+                modifier = Modifier.matchParentSize(),//.fillMaxSize(),
                 imageWidth = w,
                 imageHeight = h,
                 controls = controls,
@@ -725,15 +1070,15 @@ fun PreviewWithOverlay(
         }
     }
 
-    Spacer(Modifier.height(12.dp))
-
-    ControlsPanel(
-        imageWidth = w,
-        imageHeight = h,
-        controls = controls,
-        onControlsChange = onControlsChange,
-        enabled = isCameraOpen
-    )
+//    Spacer(Modifier.height(12.dp))
+//
+//    ControlsPanel(
+//        imageWidth = w,
+//        imageHeight = h,
+//        controls = controls,
+//        onControlsChange = onControlsChange,
+//        enabled = isCameraOpen
+//    )
 }
 
 @Composable
@@ -774,7 +1119,10 @@ fun UvcCameraScreen(
     debugText: String,
     statusColor: Int,
     imageWidth: Int?,
-    imageHeight: Int?
+    imageHeight: Int?,
+    controls: OverlayControls,
+    onControlsChange: (OverlayControls) -> Unit,
+    startPhoneCamera: (androidx.camera.view.PreviewView) -> Unit
 ) {
     val scrollState = rememberScrollState()
 
@@ -792,33 +1140,35 @@ fun UvcCameraScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(scrollState),
-            horizontalAlignment = Alignment.CenterHorizontally
+//                .padding(padding)
+//                .verticalScroll(scrollState),
+//            horizontalAlignment = Alignment.CenterHorizontally
         ) {
             // ── Status indicator ─────────────────────────────────
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                shape = RoundedCornerShape(8.dp),
-                color =
-                when (statusColor) {
-                    0 -> Color(0xFFD32F2F) // red
-                    1 -> Color(0xFFFBC02D) // yellow
-                    2 -> Color(0xFF388E3C) // green
-                    else -> Color(0x00000000)
-                }
-            ) {
-                Text(
-                    text = statusText,
-                    modifier = Modifier.padding(12.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                    textAlign = TextAlign.Center
-                )
-            }
+//            Surface(
+//                modifier = Modifier
+//                    .fillMaxWidth()
+//                    .padding(horizontal = 16.dp, vertical = 8.dp),
+//                shape = RoundedCornerShape(8.dp),
+//                color =
+//                when (statusColor) {
+//                    0 -> Color(0xFFD32F2F) // red
+//                    1 -> Color(0xFFFBC02D) // yellow
+//                    2 -> Color(0xFF388E3C) // green
+//                    else -> Color(0x00000000)
+//                }
+//            ) {
+//                Text(
+//                    text = statusText,
+//                    modifier = Modifier.padding(12.dp),
+//                    style = MaterialTheme.typography.bodyMedium,
+//                    textAlign = TextAlign.Center
+//                )
+//            }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            // ── Status indicator ─────────────────────────────────
+
+//            Spacer(modifier = Modifier.height(8.dp))
 
 //            Box(
 //                modifier = Modifier
@@ -854,19 +1204,20 @@ fun UvcCameraScreen(
 //                    )
 //                }
 //            }
-            var controls by remember { mutableStateOf(OverlayControls()) }
+//            var controls by remember { mutableStateOf(OverlayControls()) }
 
             PreviewWithOverlay(
                 imageWidth = imageWidth,
                 imageHeight = imageHeight,
                 controls = controls,
-                onControlsChange = { controls = it },
+                onControlsChange = onControlsChange,
                 onSurfaceAvailable = onSurfaceAvailable,
                 onSurfaceDestroyed = onSurfaceDestroyed,
-                isCameraOpen = isCameraOpen
+                isCameraOpen = isCameraOpen,
+                startPhoneCamera = startPhoneCamera // { previewView -> startPhoneCamera(previewView) }
             )
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(Modifier.height(12.dp))
 
 //            // ── Capture button ───────────────────────────────────
 //            Button(
@@ -885,53 +1236,248 @@ fun UvcCameraScreen(
 //                )
 //            }
 
-            Spacer(modifier = Modifier.height(16.dp))
+//            Spacer(modifier = Modifier.height(16.dp))
 
+//            Spacer(modifier = Modifier.height(24.dp))
 
-            Spacer(modifier = Modifier.height(24.dp))
-            if (spectrumData != null) {
-                if (spectrumData.intensities.isEmpty() || spectrumData.wavelengths.isEmpty()) {
-                    Text("Waiting for spectrum...")
-                } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp)
+            ) {
 
-                    val pairs = spectrumData.wavelengths.zip(spectrumData.intensities)
-                        .sortedBy { it.first } // wavelength increasing left->right
-                    val step = 4
-                    val sampled = pairs.filterIndexed { i, _ -> i % step == 0 }
-                    val entries = pairs.map { (lambda, intensity) ->
-                        FloatEntry(lambda, intensity)
-                    }
-                    val model = entryModelOf(entries)
-                    val wavelengthFormatter: AxisValueFormatter<AxisPosition.Horizontal.Bottom> =
-                        AxisValueFormatter { x, _ ->
-                            "%.1f".format(x) // x IS the wavelength
+                val w = (imageWidth ?: 1920).coerceAtLeast(1)
+                val h = (imageHeight ?: 1080).coerceAtLeast(1)
+
+                ControlsPanel(
+                    imageWidth = w,
+                    imageHeight = h,
+                    controls = controls,
+                    onControlsChange = onControlsChange,
+                    enabled = isCameraOpen
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                if (spectrumData != null) {
+                    if (spectrumData.intensities.isEmpty() || spectrumData.wavelengths.isEmpty()) {
+                        Text("Waiting for spectrum...")
+                    } else {
+
+//                    val pairs = spectrumData.wavelengths.zip(spectrumData.intensities)
+//                        .sortedBy { it.first } // wavelength increasing left->right
+//                    val step = 2
+//                    val sampled = pairs.filterIndexed { i, _ -> i % step == 0 }
+//                    val entries = pairs.map { (lambda, intensity) ->
+//                        FloatEntry(lambda, intensity)
+//                    }
+//                    val entries = sampled.map { (lambda, intensity) ->
+//                        FloatEntry(lambda, intensity)
+//                    }
+//                    val model = entryModelOf(entries)
+//                    val wavelengthFormatter: AxisValueFormatter<AxisPosition.Horizontal.Bottom> =
+//                        AxisValueFormatter { x, _ ->
+//                            "%.1f".format(x) // x IS the wavelength
+//                        }
+//                    val wavelengthFormatter =
+//                        AxisValueFormatter<AxisPosition.Horizontal.Bottom> { x, _ ->
+//                            "${(x / 500).toInt() * 500}"
+//                        }
+
+//                    val bottomAxis = rememberBottomAxis(
+//                        guideline = null, // no vertical gridlines
+////                        tick = LineComponent(),      // optional: no ticks
+//                        valueFormatter = wavelengthFormatter,
+//                        itemPlacer = AxisItemPlacer.Horizontal.default(
+//                            spacing = 200,
+//                            offset = 0,
+//                            shiftExtremeTicks = true,
+//                            addExtremeLabelPadding = true,
+//                        ),
+//                    )
+//
+//                    val startAxis = rememberStartAxis(guideline = null) // intensity axis
+
+                        Box(modifier = Modifier.fillMaxWidth()) {
+
+//                        Chart(
+//                            chart = LineChart(),
+//                            model = model,
+//                            modifier = Modifier
+//                                .fillMaxWidth()
+//                                .height(220.dp)
+//                                .padding(start = 40.dp, bottom = 20.dp),  // space for axes
+//                            startAxis = startAxis,
+//                            bottomAxis = bottomAxis,
+//                            isZoomEnabled = false,
+//                            chartScrollSpec = rememberChartScrollSpec(isScrollEnabled = false),
+//                            chartScrollState = rememberChartScrollState(),
+//                        )
+
+                            Canvas(
+                                modifier = Modifier
+                                    .fillMaxWidth(0.95f)
+                                    .height(300.dp)
+                                    .padding(bottom = 40.dp, start = 30.dp, top = 30.dp)
+                            ) {
+                                val width = size.width
+                                val height = size.height
+
+                                val wavelengths = spectrumData.wavelengths
+                                val intensities = spectrumData.intensities
+
+                                if (wavelengths.isEmpty() || intensities.isEmpty()) return@Canvas
+
+                                val minX = 0f
+                                val maxX = wavelengths.maxOrNull() ?: 1f
+
+                                val minY = 0f
+                                val maxY = intensities.maxOrNull() ?: 1f
+
+                                // --- Scaling functions ---
+                                fun mapX(x: Float) = (x - minX) / (maxX - minX) * width
+                                fun mapY(y: Float) = height - (y - minY) / (maxY - minY) * height
+
+                                // --- Draw spectrum ---
+                                val step = 2
+                                for (i in 0 until wavelengths.size - 1 step step) {
+
+                                    val j = minOf(i + step, wavelengths.lastIndex)
+
+                                    val x1 = mapX(wavelengths[i])
+                                    val y1 = mapY(intensities[i])
+
+                                    val x2 = mapX(wavelengths[j])
+                                    val y2 = mapY(intensities[j])
+
+                                    drawLine(
+                                        color = androidx.compose.ui.graphics.Color.Black,
+                                        start = Offset(x1, y1),
+                                        end = Offset(x2, y2),
+                                        strokeWidth = 3f
+                                    )
+                                }
+
+                                val xTicks = 6
+                                for (i in 0..xTicks) {
+                                    val value = i * maxX / xTicks
+                                    val x = mapX(value)
+
+                                    // Vertical grid lines
+                                    drawLine(
+                                        color = androidx.compose.ui.graphics.Color.LightGray,
+                                        start = Offset(x, 0f),
+                                        end = Offset(x, height),
+                                        strokeWidth = 1f
+                                    )
+
+                                    // Tick marks
+                                    drawLine(
+                                        color = androidx.compose.ui.graphics.Color.Black,
+                                        start = Offset(x, height),
+                                        end = Offset(x, height - 10f),
+                                        strokeWidth = 2f
+                                    )
+
+                                    // Labels
+                                    drawContext.canvas.nativeCanvas.drawText(
+//                                        "${tick.toInt()}",
+                                        "%.1f".format(value),
+                                        x,
+                                        height + 30f,
+                                        android.graphics.Paint().apply {
+                                            textSize = 20f
+                                            textAlign = android.graphics.Paint.Align.CENTER
+                                        }
+                                    )
+
+//                                    tick += tickSpacing
+                                }
+
+                                // --- Y ticks ---
+                                val yTicks = 5
+                                for (i in 0..yTicks) {
+                                    val value = i * maxY / yTicks
+                                    val y = mapY(value)
+
+                                    // Horizontal grid lines
+                                    drawLine(
+                                        color = androidx.compose.ui.graphics.Color.LightGray,
+                                        start = Offset(0f, y),
+                                        end = Offset(width, y),
+                                        strokeWidth = 1f
+                                    )
+
+                                    // Tick marks
+                                    drawLine(
+                                        color = androidx.compose.ui.graphics.Color.Black,
+                                        start = Offset(0f, y),
+                                        end = Offset(10f, y),
+                                        strokeWidth = 2f
+                                    )
+
+                                    // Labels
+                                    drawContext.canvas.nativeCanvas.drawText(
+                                        "%.1f".format(value),
+                                        -10f,
+                                        y,
+                                        android.graphics.Paint().apply {
+                                            textSize = 20f
+                                            textAlign = android.graphics.Paint.Align.RIGHT
+                                        }
+                                    )
+                                }
+
+                                // --- Draw axes ---
+                                drawLine(
+                                    color = androidx.compose.ui.graphics.Color.Black,
+                                    start = Offset(0f, height),
+                                    end = Offset(width, height),
+                                    strokeWidth = 3f
+                                )
+
+                                drawLine(
+                                    color = androidx.compose.ui.graphics.Color.Black,
+                                    start = Offset(0f, 0f),
+                                    end = Offset(0f, height),
+                                    strokeWidth = 3f
+                                )
+
+                                // Draw calibration lines
+                                val value1 = OverlayControls().calLambda1
+                                val value2 = OverlayControls().calLambda2
+                                drawLine(
+                                    color = androidx.compose.ui.graphics.Color.Red,
+                                    start = Offset(mapX(value1), 0f),
+                                    end = Offset(mapX(value1), height),
+                                    strokeWidth = 1f
+                                )
+
+                                drawLine(
+                                    color = androidx.compose.ui.graphics.Color.Red,
+                                    start = Offset(mapX(value2), 0f),
+                                    end = Offset(mapX(value2), height),
+                                    strokeWidth = 1f
+                                )
+
+                            }
+
+                            // Y-axis label
+                            Text(
+                                "Intensity (a.u.)",
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                            )
+
+                            // X-axis label
+                            Text(
+                                "Wavelength (nm)",
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                            )
                         }
-
-                    val bottomAxis = rememberBottomAxis(
-                        guideline = null, // no vertical gridlines
-                        tick = null,      // optional: no ticks
-                        valueFormatter = wavelengthFormatter,
-                        itemPlacer = AxisItemPlacer.Horizontal.default(
-                            spacing = 200,              // show a label about every 200 samples
-                            offset = 0,
-                            shiftExtremeTicks = true,
-                            addExtremeLabelPadding = true,
-                        ),
-                    )
-
-                    val startAxis = rememberStartAxis(guideline = null) // intensity axis
-                    Chart(
-                        chart = LineChart(),
-                        model = model,
-                        modifier = Modifier.fillMaxWidth().height(220.dp),
-                        startAxis = startAxis,
-                        bottomAxis = bottomAxis,
-                        isZoomEnabled = false,
-                        chartScrollSpec = rememberChartScrollSpec(isScrollEnabled = false),
-                        chartScrollState = rememberChartScrollState(),
-                        //getXStep = { 1f },
-                    )
-
+                    }
                 }
             }
         }
