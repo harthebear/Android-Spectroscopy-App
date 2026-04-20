@@ -77,7 +77,7 @@ import com.patrykandpatrick.vico.core.component.shape.LineComponent
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 
-private val USE_USB_CAMERA = false
+private val USE_USB_CAMERA = true
 
 data class SpectrumData(
     val wavelengths: List<Float>,
@@ -131,6 +131,15 @@ class MainActivity : ComponentActivity() {
     private val _pixelDataSummary = mutableStateOf<String?>(null)
     private val imageWidthState = mutableStateOf<Int?>(null)
     private val imageHeightState = mutableStateOf<Int?>(null)
+
+    private val ROITop = mutableStateOf(1)
+    private val ROIBot = mutableStateOf(1919)
+    private val Calx1 = mutableStateOf(1575)
+    private val Calx2 = mutableStateOf(1365)
+    private val CalLambda1 = mutableStateOf(436.0f)
+    private val CalLambda2 = mutableStateOf(546.0f)
+
+    private val controlsState = mutableStateOf(OverlayControls())
 
     // ── Current USB device (for multi-device filtering) ──────────────
     private var currentUsbDevice: UsbDevice? = null
@@ -206,6 +215,8 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MaterialTheme {
+                val controls = controlsState.value
+
                 UvcCameraScreen(
                     statusText = _statusText.value,
                     isCameraOpen = _isCameraOpen.value,
@@ -222,14 +233,11 @@ class MainActivity : ComponentActivity() {
                     imageHeight = imageHeightState.value,
 
                     controls = controls,
-                    onControlsChange = { controls = it },
+                    onControlsChange = { controlsState.value = it },
 
                     startPhoneCamera = { previewView ->
-                        startPhoneCamera(previewView) { controls }
+                        startPhoneCamera(previewView) { controlsState.value }
                     }
-//                    startPhoneCamera = { previewView ->
-//                        startPhoneCamera(previewView, controls)
-//                    }
                 )
             }
         }
@@ -472,10 +480,16 @@ class MainActivity : ComponentActivity() {
     private fun processFrame(
         data: ByteArray,
         width: Int,
-        height: Int
+        controls: OverlayControls,
+        displayHeight: Int,
+        displayWidth: Int
     ) {
-        val y0 = 500          // pick these by inspection
-        val y1 = 580          // (inclusive/exclusive OK either way)
+        val y0 = (controls.roiTopY * displayHeight).toInt().coerceIn(0, displayHeight - 1)
+        val y1 = (controls.roiBottomY * displayHeight).toInt().coerceIn(0, displayHeight)
+        val x0 = (controls.calX1 * displayWidth).toInt().coerceIn(0, displayWidth - 1)
+        val x1 = (controls.calX2 * displayWidth).toInt().coerceIn(0, displayWidth)
+        val wave1 = controls.calLambda1
+        val wave2 = controls.calLambda2
         val roiH = (y1 - y0).coerceAtLeast(1)
 
         val spectrum = FloatArray(width)
@@ -495,10 +509,11 @@ class MainActivity : ComponentActivity() {
 
         runOnUiThread {
             val intensities = spectrum.toList()
-            val slope = (546.0f - 436.0f) / (1365.0f - 1575.0f)
-            val intercept = 436.0f
+            //val slope = (546.0f - 436.0f) / (1365.0f - 1575.0f)
+            val intercept = controls.calLambda1
+            val slope = (controls.calLambda2 - controls.calLambda1) / (x1 - x0)
             val wavelengths = List(spectrum.size) { i ->
-                val w = intercept + slope * (i - 1570.0f)
+                val w = intercept + slope * (i - x0)
                 (w * 100).toInt() / 100f
             }
 
@@ -573,8 +588,8 @@ class MainActivity : ComponentActivity() {
                     val width = imageWidth ?: return@IFrameCallback
                     val height = imageHeight ?: return@IFrameCallback
                     Log.d(TAG, "frameBytes=${data.size}, expectedYUYV=${width*height*2}, expectedRGB=${width*height*3}")
-
-                    processFrame(data, width, height)
+                    val controls = controlsState.value
+                    processFrame(data, width, controls, displayHeight = height, displayWidth = width)
                 },
                 // Argument 2: The pixel format constant, found in the underlying serenegiant library.
                 4
@@ -962,7 +977,9 @@ fun ControlsPanel(
             value = (controls.roiTopY * imageHeight).toInt(),
             range = yRange,
             enabled = enabled,
-            onValueChange = { updateRoi(topY = it) }
+            onValueChange = { updateRoi(topY = it)
+                //ROITop.value
+            }
         )
 
         SliderWithIntField(
